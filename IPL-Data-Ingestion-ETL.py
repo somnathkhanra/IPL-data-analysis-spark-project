@@ -25,10 +25,6 @@ if not any(mount.mountPoint == mountPoint for mount in dbutils.fs.mounts()):
 
 # COMMAND ----------
 
-dbutils.fs.unmount("/mnt/ipl_raw")
-
-# COMMAND ----------
-
 
 display(dbutils.fs.ls("/mnt/ipl/"))
 display(dbutils.fs.ls("dbfs:/mnt/ipl/raw_data/"))
@@ -58,6 +54,36 @@ ball_by_ball_df = spark.read.schema(ball_by_ball_schema).format("csv").option("h
 
 # COMMAND ----------
 
+# Filter to include only valid deliveries (excluding extras like wides and no balls for specific analyses)
+ball_by_ball_df = ball_by_ball_df.filter((col("wides") == 0) & (col("noballs") == 0) )
+
+# Aggregation: Calculate the total and average runs scored in each match and inning
+total_and_avg_runs = ball_by_ball_df.groupBy("match_id", "innings_no").agg(
+    sum("runs_scored").alias("total_runs"),
+    avg("runs_scored").alias("average_runs")
+)
+
+
+# COMMAND ----------
+
+# Window Function: Calculate running total of runs in each match for each over
+
+WindowSpec = Window.partitionBy("match_id", "innings_no").orderBy("over_id")
+
+ball_by_ball_df = ball_by_ball_df.withColumn("running_total_runs", sum("runs_scored").over(WindowSpec))
+
+
+# COMMAND ----------
+
+# Conditional Column: Flag for high impact balls (either a wicket or more than 6 runs including extras)
+ball_by_ball_df = ball_by_ball_df.withColumn(
+    "high_impact", when((col("runs_scored") + col("extra_runs") > 6) | (col("bowler_wicket") == True), True).otherwise(False)
+)
+#ball_by_ball_df.show(2)
+ball_by_ball_df.printSchema()
+
+# COMMAND ----------
+
 
 match_schema = StructType([
     StructField("match_sk", IntegerType(), nullable=True),
@@ -84,6 +110,32 @@ match_df = spark.read.schema(match_schema).format("csv").option("header", "true"
 
 # COMMAND ----------
 
+from pyspark.sql.functions import year, month, dayofmonth, when
+
+# Extracting year, month, and day from the match date for more detailed time-based analysis
+match_df = match_df.withColumn("year", year("match_date"))
+match_df = match_df.withColumn("month", month("match_date"))
+match_df = match_df.withColumn("dayofmonth", dayofmonth("match_date"))
+
+# High margin win: categorizing win margins into 'high', 'medium', and 'low'
+match_df = match_df.withColumn(
+    "win_margin_category",
+    when(col("win_margin") >= 100, "high")
+    .when((col("win_margin") >=  50) & (col("win_margin") < 100), "medium")
+    .otherwise("low")
+)
+
+# Analyze the impact of the toss: who wins the toss and the match
+match_df = match_df.withColumn(
+    "toss_match_winner",
+    when(col("toss_winner") == col("match_winner"), "Yes").otherwise("No")
+)
+
+# Show the enhanced match DataFrame
+match_df.show(2)
+
+# COMMAND ----------
+
 
 player_schema = StructType([
     StructField("player_sk", IntegerType(), nullable=True),
@@ -98,6 +150,27 @@ player_schema = StructType([
 player_df = spark.read.schema(player_schema).format("csv").option("header", "true").load("dbfs:/mnt/ipl/raw_data/player.csv")
 
 player_df.show(2)
+
+# COMMAND ----------
+
+from pyspark.sql.functions import lower, regexp_replace
+
+
+# Normalize and clean player names
+player_df = player_df.withColumn("player_name", lower(regexp_replace("player_name", "[^a-zA-Z0-9 ]", "")))
+#player_df.show(10)
+
+# Handle missing values in 'batting_hand' and 'bowling_skill' with a default 'unknown'
+player_df = player_df.na.fill({"batting_hand": "unknown", "bowling_skill": "unknown"})
+
+player_df.show(10)
+
+# Categorizing players based on batting hand
+player_df = player_df.withColumn(
+    "batting_style",
+    when(col("batting_hand").contains("Left"), "Left-Handed").otherwise("Right-Handed")
+)
+#player_df.show(100)
 
 # COMMAND ----------
 
@@ -132,6 +205,26 @@ player_match_df = spark.read.schema(player_match_schema).format("csv").option("h
 
 # COMMAND ----------
 
+from pyspark.sql.functions import col, when, current_date, expr
+
+# Add a 'veteran_status' column based on player age
+
+player_match_df = player_match_df.withColumn(
+    "veteran_status",
+    when(col("age_as_on_match") >= 35, "Veteran").otherwise("Non-Veteran")
+)
+
+# Dynamic column to calculate years since debut
+
+player_match_df = player_match_df.withColumn(
+    "years_since_debut",
+    (year(current_date()) - col("season_year"))
+)
+
+player_match_df.show(2)
+
+# COMMAND ----------
+
 team_schema = StructType([
     StructField("team_sk", IntegerType(), nullable=True),
     StructField("team_id", IntegerType(), nullable=True),
@@ -160,18 +253,84 @@ team_df.coalesce(1).write.mode("overwrite").format("parquet").save("dbfs:/mnt/ip
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Creating Delta Live Tables
+
+# COMMAND ----------
+
 # Creating Delta Live Tables
-spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/ball_by_ball").write.format("delta").mode("overwrite").saveAsTable("live_ball_by_ball")
-spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/match").write.format("delta").mode("overwrite").saveAsTable("live_match")
-spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/player").write.format("delta").mode("overwrite").saveAsTable("live_player")
-spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/player_match").write.format("delta").mode("overwrite").saveAsTable("live_player_match")
-spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/team").write.format("delta").mode("overwrite").saveAsTable("live_team")
+spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/ball_by_ball").write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("live_ball_by_ball")
+spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/match").write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("live_match")
+spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/player").write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("live_player")
+spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/player_match").write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("live_player_match")
+spark.read.format("parquet").load("dbfs:/mnt/ipl/transformed_data/team").write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable("live_team")
 
 
 
 # COMMAND ----------
 
-spark.sql("SELECT * FROM live_ball_by_ball").display()
+# MAGIC %md
+# MAGIC ###  Creating External Delta Live Tables
+
+# COMMAND ----------
+
+# Creating External Delta Live Tables
+spark.sql("""
+CREATE TABLE IF NOT EXISTS external_ball_by_ball
+USING DELTA
+LOCATION 'dbfs:/mnt/ipl/delta/ball_by_ball'
+AS SELECT * FROM parquet.`dbfs:/mnt/ipl/transformed_data/ball_by_ball`
+""")
+spark.sql("""Refresh table external_ball_by_ball""")
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS external_match
+USING DELTA
+LOCATION 'dbfs:/mnt/ipl/delta/match'
+AS SELECT * FROM parquet.`dbfs:/mnt/ipl/transformed_data/match`
+""")
+spark.sql("""Refresh table external_match""")
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS external_player
+USING DELTA
+LOCATION 'dbfs:/mnt/ipl/delta/player'
+AS SELECT * FROM parquet.`dbfs:/mnt/ipl/transformed_data/player`
+""")
+spark.sql("""Refresh table external_player""")
+
+# COMMAND ----------
+
+spark.sql("""
+          CREATE TABLE IF NOT EXISTS external_player_match
+          USING DELTA
+          LOCATION 'dbfs:/mnt/ipl/delta/player_match'
+          AS SELECT * FROM parquet.`dbfs:/mnt/ipl/transformed_data/player_match`
+          """)
+spark.sql("""Refresh table external_player_match""")
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS external_team
+USING DELTA
+LOCATION 'dbfs:/mnt/ipl/delta/team'
+AS SELECT * FROM parquet.`dbfs:/mnt/ipl/transformed_data/team`
+""")
+spark.sql("""Refresh table external_team""")
+
+# COMMAND ----------
+
+spark.sql("SELECT * FROM external_ball_by_ball").display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Performing a query on the created Delta Live Tables
 
 # COMMAND ----------
 
@@ -285,3 +444,111 @@ order by wins_after_toss desc
 """)
 
 display(team_toss_win_performance)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### **Plotting Data**
+
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# COMMAND ----------
+
+# Assuming 'economical_bowlers_powerplay' is already executed and available as a Spark DataFrame
+economical_bowlers_pd = economical_bowlers_powerplay.toPandas()
+
+# Visualizing using Matplotlib
+plt.figure(figsize=(12, 10))
+# Limiting to top 10 for clarity in the plot
+top_economical_bowlers = economical_bowlers_pd.nsmallest(20, 'avg_runs_per_ball')
+plt.bar(top_economical_bowlers['player_name'], top_economical_bowlers['avg_runs_per_ball'], color='lightgreen')
+plt.xlabel('Bowler Name')
+plt.ylabel('Average Runs per Ball')
+plt.title('Most Economical Bowlers in Powerplay Overs (Top 20)')
+plt.xticks(rotation=50)
+plt.tight_layout()
+plt.show()
+
+
+
+
+# COMMAND ----------
+
+
+
+toss_impact_pd = toss_impact_individual_matches.toPandas()
+
+
+# Creating a countplot to show win/loss after winning toss
+plt.figure(figsize=(12, 8))
+sns.countplot(x='toss_winner', hue='match_outcome', data=toss_impact_pd)
+plt.title('Impact of Winning Toss on Match Outcomes')
+plt.xlabel('Toss Winner')
+plt.ylabel('Number of Matches')
+plt.legend(title='Match Outcome')
+plt.xticks(rotation=50)
+plt.tight_layout()
+plt.show()
+
+
+# COMMAND ----------
+
+average_runs_pd = average_runs_in_wins.toPandas()
+# Using seaborn to plot average runs in winning matches
+plt.figure(figsize=(10, 8))
+top_scorers = average_runs_pd.nlargest(20, 'avg_runs_in_wins')
+sns.barplot(x='player_name', y='avg_runs_in_wins', data=top_scorers)
+plt.title('Average Runs Scored by Batsmen in Winning Matches (Top 20 Scorers)')
+plt.xlabel('Player Name')
+plt.ylabel('Average Runs in Wins')
+plt.xticks(rotation=50)
+plt.tight_layout()
+plt.show()
+
+
+# COMMAND ----------
+
+scores_by_venue_pd = scores_by_venue.toPandas()
+
+# Plot
+plt.figure(figsize=(14, 10))
+sns.barplot(x='avg_score', y='venue_name', data=scores_by_venue_pd)
+plt.title('Distribution of Scores by Venue')
+plt.xlabel('Average Score')
+plt.ylabel('Venue')
+plt.show()
+
+# COMMAND ----------
+
+dismissal_types_pd = dismissal_types.toPandas()
+
+# Plot
+plt.figure(figsize=(12, 10))
+sns.barplot(x='out_type', y='frequency', data=dismissal_types_pd, palette='pastel')
+plt.title('Most Frequent Dismissal Types')
+plt.xlabel('Dismissal Type')
+plt.ylabel('Frequency')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+team_toss_win_pd = team_toss_win_performance.toPandas()
+
+# Plot
+plt.figure(figsize=(12, 10))
+sns.barplot(x='team1', y='wins_after_toss', data=team_toss_win_pd)
+plt.title('Team Performance After Winning Toss')
+plt.xlabel('Team')
+plt.ylabel('Wins After Winning Toss')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+
